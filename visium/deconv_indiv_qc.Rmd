@@ -1,0 +1,338 @@
+---
+title: "deconv_indiv_slide_qc"
+output: 
+  html_document:
+    df_output: paged
+    toc: TRUE
+    theme: 'simplex'
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = 'hide')
+```
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(gridExtra) 
+library(ggdendro)
+  library(readr)
+library(data.table)
+library(DT)
+  library(fgsea)
+  library(SpaceFold)
+})
+
+# load visium helper functions
+source("/data/peer/sam/treg_dep/scripts/visium/visium_helper_functions.R")
+# figure directory
+fig_dir = "/data/peer/sam/treg_dep/visium/results/deconv_qc"
+
+```
+
+```{r}
+# read in the visium data, now a processed RDS file
+d.m = readRDS( '/data/peer/sam/treg_dep/visium/data/requant/processed/treg_dep_visium_merged_quant2_20220829.rds')
+name_conv_df = read.csv( "/data/peer/sam/treg_dep/visium/bayesprism/viter1_nameConvSheet.csv", h = T, stringsAsFactors = F)
+# make specific mods
+name_conv_df[name_conv_df$make_name == 'Basophil','orig_name'] <- 'Basophil/Mast'
+name_conv_df[name_conv_df$make_name == 'Platelet','orig_name'] <- 'Platelet/Mega'
+name_conv_df[name_conv_df$make_name == 'Car4..capillary','orig_name'] <- 'aCap'
+name_conv_df[name_conv_df$make_name == 'Plvap..capillary','orig_name'] <- 'gCap'
+
+# read in cell type fractions
+## these will be available in same github directory
+bp_data_folder = "/data/peer/sam/treg_dep/visium/bayesprism/deconv_viter1_indiv/"
+
+ct_frac_files = list.files(bp_data_folder, pattern = "*_theta.csv", full.names = T)
+ct_cv_files = list.files(bp_data_folder, pattern = "*_thetaCV.csv", full.names = T)
+
+# read these in as a list with the same names as d, the 10x data
+ct_frac = lapply(ct_frac_files, read.csv, row.names = 1)
+names(ct_frac) = gsub("_theta.csv", "", basename(ct_frac_files))
+
+# fix rownames to match d.m
+for(i in names(ct_frac)){
+  rownames(ct_frac[[i]]) <- paste(i, rownames(ct_frac[[i]]), sep = "_")
+}
+
+# read these in as a list with the same names as d, the 10x data
+ct_cv = lapply(ct_cv_files, read.csv, row.names = 1)
+names(ct_cv) = gsub("_thetaCV.csv", "", basename(ct_cv_files))
+
+# fix rownames to match d.m
+for(i in names(ct_cv)){
+  rownames(ct_cv[[i]]) <- paste(i, rownames(ct_cv[[i]]), sep = "_")
+}
+
+# read in positive spots
+ssm = readRDS(file.path(bp_data_folder, 'sf_selected_spot_matrix.rds'))
+# fix rownames to match
+for(x in names(ssm)){
+  rownames(ssm[[x]]) = paste(x, rownames(ssm[[x]]), sep = "_")
+}
+ssm.m = do.call(rbind, ssm)
+colnames(ssm.m) = make.names(colnames(ssm.m))
+# filter for only spots in the other ones
+
+```
+
+
+```{r}
+
+# melt ct fraction values and filter for only spots that are in d.m
+ct_frac.m = do.call(rbind, ct_frac)
+rownames(ct_frac.m) = gsub("^.*\\.", "", rownames(ct_frac.m))
+ct_frac.m = ct_frac.m[rownames(ct_frac.m) %in% colnames(d.m),]
+section_id = gsub("_[AGCT]+\\-[0-9]*$", "", rownames(ct_frac.m))
+
+ct_frac.sum = ct_frac.m %>% 
+  mutate(section_id = section_id) %>%
+  group_by(section_id) %>%
+  summarise_all(mean)
+  
+```
+
+
+# cell fraction comparison across serial sections
+
+Visualize for each serial section comparison. 
+
+```{r}
+
+ct_frac.sum.sec = ct_frac.sum %>% reshape2::melt() %>%
+  tidyr::pivot_wider(names_from = section_id, values_from = value)
+
+#pdf(file.path(fig_dir, 'indiv_avgThetaComparison.pdf'), height = 6, width = 6)
+# plot each of the 4 individually
+(
+  (ggplot(ct_frac.sum.sec, aes(x = Ctrl1_A1, y = Ctrl1_B1)) +
+  geom_point() +
+  theme_classic() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = 'grey') + 
+    theme(axis.text = element_text(size = 12), 
+          axis.title = element_text(size = 14)) +
+    labs(x = 'Control 1 section 1', 
+         y = 'Control 1 section 2')) + 
+  (ggplot(ct_frac.sum.sec, aes(x = Ctrl2_C1, y = Ctrl2_D1)) +
+  geom_point() +
+  theme_classic() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = 'grey') + 
+    theme(axis.text = element_text(size = 12), 
+          axis.title = element_text(size = 14)) +
+    labs(x = 'Control 2 section 1', 
+         y = 'Control 2 section 2'))
+  ) /
+  ((ggplot(ct_frac.sum.sec, aes(x = DT1_A1, y = DT1_B1)) +
+  geom_point() +
+  theme_classic() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = 'grey') + 
+    theme(axis.text = element_text(size = 12), 
+          axis.title = element_text(size = 14)) +
+    labs(x = 'Treg depleted 1 section 1', 
+         y = 'Treg depleted 1 section 2')) + 
+    (ggplot(ct_frac.sum.sec, aes(x = DT2_C1, y = DT2_D1)) +
+  geom_point() +
+  theme_classic() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = 'grey') + 
+    theme(axis.text = element_text(size = 12), 
+          axis.title = element_text(size = 14)) +
+    labs(x = 'Treg depleted 2 section 1', 
+         y = 'Treg depleted 2 section 2'))
+  )
+#dev.off()
+```
+Or visualize all together. 
+
+```{r}
+
+ct_frac.sum.stack = rbind(setNames(ct_frac.sum.sec[,c(2,3)], c('section_1', 'section_2')), 
+                          setNames(ct_frac.sum.sec[,c(4,5)], c('section_1', 'section_2')), 
+                          setNames(ct_frac.sum.sec[,c(6,7)], c('section_1', 'section_2')), 
+                          setNames(ct_frac.sum.sec[,c(8,9)], c('section_1', 'section_2')))
+
+#pdf(file.path(fig_dir, 'indiv_avgThetaComparison_allTogether.pdf'), height = 4, width = 4)
+ggplot(ct_frac.sum.stack, aes(x = section_1, y = section_2)) +
+  geom_point() +
+  theme_classic() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = 'grey') + 
+  labs(x = 'Serial section 1\naverage cell fraction', y = 'Serial section 2\naverage cell fraction') + 
+    theme(axis.text = element_text(size = 12), 
+          axis.title = element_text(size = 14)) +
+  ggpubr::stat_cor(method = "spearman", label.x = 0, label.y = .3, size = 4)
+#dev.off()
+```
+
+# theta CV values for cell types
+
+Looking at the coefficient of variation of theta values during bayesprism deconvolution. 
+
+```{r}
+
+# melt ct fraction values and filter for only spots that are in d.m
+ct_cv.m = do.call(rbind, ct_cv)
+rownames(ct_cv.m) = gsub("^.*\\.", "", rownames(ct_cv.m))
+ct_cv.m = ct_cv.m[rownames(ct_cv.m) %in% colnames(d.m),]
+section_id = gsub("_[AGCT]+\\-[0-9]*$", "", rownames(ct_cv.m))
+
+# filter the positive spot matrix to contain the same spots in the same order
+ssm.m = ssm.m[rownames(ct_cv.m),]
+
+# extract positive spots for each cell type
+ct_cv.pos = extractPositiveSpots(ct_cv.m, ssm.m)
+ct_cv.pos$celltype = left_join(ct_cv.pos, name_conv_df, by = c('celltype' = 'make_name')) %>%
+  .$orig_name
+```
+
+```{r}
+
+ggplot(ct_cv.pos, aes(x = celltype, y = value)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5), 
+        axis.text = element_text(size = 14), 
+        axis.title = element_text(size = 16)) +
+  labs(x = "Cell type", y = "Cell fraction C.V.")
+
+```
+
+
+```{r}
+# look at the 90th percentile for each of the cell types
+ct_cv.q9 = ct_cv.pos %>% 
+  group_by(celltype) %>%
+  summarise(q90 = quantile(value, .9))
+  
+```
+
+Plot the 90th percentile of cv values for each cell type in positive spots. 
+
+```{r}
+
+#pdf(file.path(fig_dir, '90th_percentile_CV_indiv.pdf'), height = 3, width = 3)
+ggplot(ct_cv.q9, aes(x = 'All celltypes', y = q90)) +
+  geom_boxplot(width = .6) + 
+  theme_classic() + 
+  theme(axis.text = element_text(size = 14), 
+        axis.title = element_text(size = 16), 
+        axis.title.x = element_blank()) +
+  labs(y = '90th percentile C.V.') + 
+  ylim(c(0,1))
+#dev.off()
+```
+
+
+
+# robustness to downsample
+
+```{r}
+
+# read in the cell fractions from all the runs
+ds_folder = '/data/peer/sam/treg_dep/visium/bayesprism/deconv_viter1_downsample'
+ds_files = list.files(ds_folder, "*_theta.csv", recursive = T, full.names = T)
+
+
+# read these in
+ct_frac_ds = lapply(ds_files, read.csv, row.names = 1)
+names(ct_frac_ds) <- unlist(lapply(strsplit(ds_files, "/"), "[[", 9))
+ct_frac_comp = ct_frac$DT2_C1
+rownames(ct_frac_comp) = gsub("DT2_C1_", "", rownames(ct_frac_comp))
+# filter all of the downsampled runs for spots that are in the comparison section
+ct_frac_ds = lapply(ct_frac_ds, function(x){
+  x[rownames(x) %in% rownames(ct_frac_comp),]
+})
+ct_frac_comp = ct_frac_comp[rownames(ct_frac_ds$run_1),]
+```
+
+For each downsampled run, what is the pearson correlation of the cell type fractions for each cell type in each spot?
+
+This should be done setting all cell fractions below .001 (our cutoff) to 0 to avoid comparisons that are not
+
+```{r}
+
+pcds = do.call(rbind, lapply(names(ct_frac_ds), function(x){
+  #print(head(x))
+  ct_cor = unlist(lapply(colnames(ct_frac_ds[[x]]), function(ct){
+    ct_frac_comp_ct = ct_frac_comp[,ct]
+    ct_frac_comp_ds = ct_frac_ds[[x]][,ct]
+    cor(ct_frac_comp_ct, ct_frac_comp_ds, method = 'spearman') 
+  }
+  ))
+  data.frame(spearman_cor = ct_cor, 
+                     celltype = colnames(ct_frac_ds[[x]]), 
+             run = x)
+})
+)
+  
+pcds$celltype = left_join(pcds, name_conv_df, by = c('celltype' = 'make_name')) %>%
+  .$orig_name
+```
+
+```{r, fig.height=2, fig.width=3}
+pdf(file.path(fig_dir, 'spearman_cor_in_downsampled.pdf'), height = 5, width = 6)
+ggplot(pcds, aes(x = celltype, y = spearman_cor)) +
+  geom_boxplot() +
+  #geom_point() +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5), 
+        axis.text = element_text(size = 14), 
+        axis.title = element_text(size = 16)) +
+  labs(x = "Cell type", y = "Spearman correlation to \nnon-down sampled")
+  #ylim(c(.5, 1))
+
+ggplot(pcds, aes(x = celltype, y = spearman_cor)) +
+  geom_boxplot() +
+  #geom_point() +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5), 
+        axis.text = element_text(size = 14), 
+        axis.title = element_text(size = 16)) +
+  labs(x = "Cell type", y = "Spearman correlation to \nnon-down sampled") +
+  ylim(c(0,1))
+dev.off()
+```
+
+```{r}
+
+#pdf(file.path(fig_dir, 'spearman_cor_in_downsampled_dotplot.pdf'), height = 5, width = 6)
+# make this a dotplot with std error bar
+pcds %>%
+  group_by(celltype) %>%
+  summarise(mean_spearman = mean(spearman_cor), 
+            upper = max(spearman_cor), 
+            lower = min(spearman_cor)) %>%
+  ggplot(., aes(x = celltype, y = mean_spearman)) +
+  #geom_boxplot() +
+  geom_errorbar(aes(ymin = lower, ymax = upper),col = "grey60", 
+                width =  .75) +
+  geom_point(size = 1) +
+  
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5), 
+        axis.text = element_text(size = 14), 
+        axis.title = element_text(size = 16)) +
+  labs(x = "Cell type", y = "Spearman correlation to \nnon-down sampled") +
+  ylim(c(0,1))
+#dev.off()
+
+```
+
+Write out this data for future needs
+
+```{r, eval = F, include = F}
+
+write.csv(pcds, file.path(fig_dir, 'spearman_cor_in_downsampled_df.csv'), 
+          quote = F, row.names = F)
+
+
+```
+
+

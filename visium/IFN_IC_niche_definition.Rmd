@@ -1,0 +1,580 @@
+---
+title: "IFN_IC_niche_v5"
+output: 
+  html_document:
+    df_output: paged
+    toc: TRUE
+    theme: 'simplex'
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, message = 'hide')
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(gridExtra) 
+library(ggdendro)
+  library(readr)
+library(data.table)
+library(DT)
+  library(fgsea)
+  library(sf)
+  library(limma)
+})
+
+# load my functions
+source("/data/peer/sam/treg_dep/scripts/visium/visium_helper_functions.R")
+# figure directory
+fig_dir = "/data/peer/sam/treg_dep/visium/results/factor_usage/"
+
+# set seed for reproducibility
+set.seed(1234)
+
+```
+
+
+# Factor expression niche analysis
+
+```{r, message = F, results = 'hide'}
+
+## load 10x data and cell fractions
+
+# load data and remove off tissue points
+# this folder will be set to where 10x visium data files are stored
+base_folder = '/data/peer/sam/treg_dep/visium/data/requant'
+
+# set working dir
+#setwd(base_folder)
+
+# dirs where visium samples are
+data_folders <- list.dirs(base_folder, recursive = T)
+data_folders <- data_folders[grepl("outs$", data_folders)]
+
+# read in visium data
+d <- lapply(data_folders, Load10X_Spatial)
+names(d) <- unlist(lapply(strsplit(data_folders, "/"), "[[", 10)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+
+# add necessary metadata to the tissue sections
+lapply(names(d), function(x){
+  d[[x]]@meta.data <<- mutate(d[[x]]@meta.data, section = x, 
+                              treatment = ifelse(grepl("Ctrl", x), 'Ctrl', 'DT'))
+})
+# read in cell type fractions
+## these will be available in same github directory
+bp_data_folder = "/data/peer/sam/treg_dep/visium/bayesprism/deconv_viter1"
+
+ct_frac_files = list.files(bp_data_folder, pattern = "*_theta.csv", full.names = T)
+
+deconv_base_folder = '/data/peer/sam/treg_dep/visium/bayesprism'
+deconv_folders = c('deconv_viter1')
+
+# read in cell fraction files and collapse to a single data frame
+ct_frac = lapply(deconv_folders, function(folder){
+  ct_frac_files = list.files(file.path(deconv_base_folder, folder), pattern = "*_theta.csv", full.names = T)
+  ct.l = lapply(ct_frac_files, read.csv, row.names = 1)
+  #names(ct.l) = gsub("_theta.csv", "", ct_frac_files)
+  ct.lm = do.call(rbind,ct.l)
+  colnames(ct.lm) = make.names(colnames(ct.lm))
+  return(ct.lm)
+})
+names(ct_frac) = deconv_folders
+
+# first split the cellfractions into the different tissue sections
+
+split.idx = remove_barcode(rownames(ct_frac$deconv_viter1))
+ct_frac.l = split(ct_frac$deconv_viter1, factor(split.idx))
+
+
+# change the rownames of the slides to be indexed by section as well 
+invisible(lapply(names(d), function(x){
+#  rownames(d[[x]]@meta.data) <<- paste(d[[x]]@meta.data$section, rownames(d[[x]]@meta.data), sep = ".")
+  d[[x]] <<- RenameCells(d[[x]], new.names = paste(d[[x]]@meta.data$section, rownames(d[[x]]@meta.data), sep = "_"))
+}))
+
+# filter the 10x objects that I have for only spots that are in deconvolution
+d = lapply(names(d), function(x){
+  subset(d[[x]], cells = rownames(ct_frac.l[[x]]))
+})
+names(d) <- unlist(lapply(strsplit(data_folders, "/"), "[[", 10)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+
+
+
+# add cell type fractions to each section
+lapply(names(d), function(x){
+  ct_obj = CreateAssayObject(counts = ct_frac.l[[x]] %>% t())
+  d[[x]][['BP']] <<- ct_obj
+})
+
+
+
+# read in selected spot matrix
+ssm = read.csv(file.path(bp_data_folder, 'selected_spot_matrix.median.csv' ), 
+               row.names = 1, stringsAsFactors = F)
+
+# read in cell type name conversion
+name_conv_df = read.csv( "/data/peer/sam/treg_dep/visium/bayesprism/viter1_nameConvSheet.csv", h = T, stringsAsFactors = F)
+
+```
+
+
+## Shared and unique genes on factors
+
+Find shared genes involved in IFN and IC response across lineages as well as specific genes induced in these factors in particular lineages. 
+
+```{r}
+
+# function to get the genes along each factor
+get_factor_genes = function(fac, gene_names){
+  fac_mean = mean(fac)
+  fac_std = sd(fac)
+  
+  fac_thresh = fac_mean + (2*fac_std)
+  
+  # get the factor genes and order by their score
+  fac_scores = fac[fac > fac_thresh]
+  names(fac_scores) = gene_names[fac > fac_thresh] %>% stringr::str_to_title()
+  fac_genes = sort(fac_scores, decreasing = T) #%>% names()
+  
+  # return the gene names of associated terms to factor
+  return(fac_genes)
+}
+
+read_factor_files = function(file_list){
+  fac.l = invisible(lapply(file_list, readr::read_csv, show_col_types = F))
+  names(fac.l) = sapply(file_list, basename) %>% gsub("*_factor_|\\.csv", "", .)
+  
+  # bind into matrix
+  fac.mat = fac.l %>% purrr::reduce(left_join, by = '...1') %>% as.data.frame()
+  rownames(fac.mat) = fac.mat$...1
+  fac.mat = fac.mat[,-1]
+  
+  return(fac.mat)
+}
+
+
+
+```
+
+```{r}
+
+# list of lists for the factor file names
+mm_factor_files = list(endo = list.files(path = "/data/peer/sam/treg_dep/mouse/results/schpf/endo", pattern = "*.csv", full.names = T), 
+                       fib = list.files(path = "/data/peer/sam/treg_dep/mouse/results/schpf/fib", pattern = "*.csv", full.names = T), 
+                       myeloid = list.files(path = "/data/peer/sam/treg_dep/mouse/results/schpf/myeloid", pattern = "*.csv", full.names = T))
+
+mm_factor.l = lapply(mm_factor_files, read_factor_files)
+
+fac_genes = lapply(mm_factor.l, function(x){
+  apply(x, 2, get_factor_genes, rownames(x))
+})
+```
+```{r, eval = F, inclue = F}
+# code to output genes selected for each factor
+
+fac_genes.m = do.call(rbind, lapply(fac_genes, function(x) { reshape2::melt(lapply(x, function(y){ as.matrix(y)})
+                                                                                   )})) %>%
+  tibble::rownames_to_column(var = 'lineage') %>%
+  mutate(lineage = gsub("\\.[0-9]+$", "", lineage)) %>%
+  dplyr::rename(gene = Var1, gene_score = value, factor = L1) %>%
+  dplyr::select(-Var2)
+
+# write this out in a processed data location
+write.csv(fac_genes.m, file = '/data/peer/sam/treg_dep/mouse/results/schpf/processed/mouse_factor_associatedGenes.csv', 
+          quote = F, row.names = F)
+
+```
+
+
+```{r}
+
+# get genes that are shared and unique for particular factors
+ifn_shared = Reduce(intersect, list(names(fac_genes$endo$`Factor-19`), names(fac_genes$fib$`Factor-9`), names(fac_genes$myeloid$`Factor-17`)))
+ifn_unique = list()
+ifn_unique[['endo']] = setdiff(names(fac_genes$endo$`Factor-19`), names(fac_genes$fib$`Factor-9`)) %>% setdiff(., names(fac_genes$myeloid$`Factor-17`))
+ifn_unique[['fib']] = setdiff(names(fac_genes$fib$`Factor-9`), names(fac_genes$endo$`Factor-19`)) %>% setdiff(., names(fac_genes$myeloid$`Factor-17`))
+ifn_unique[['myeloid']] = setdiff(names(fac_genes$myeloid$`Factor-17`), names(fac_genes$endo$`Factor-19`)) %>% setdiff(., names(fac_genes$fib$`Factor-9`) )
+
+# get genes that are shared and unique for particular factors
+ic_shared = Reduce(intersect, list(names(fac_genes$endo$`Factor-15`), names(fac_genes$fib$`Factor-22`), names(fac_genes$myeloid$`Factor-21`)))
+ic_unique = list()
+ic_unique[['endo']] = setdiff(names(fac_genes$endo$`Factor-15`), names(fac_genes$fib$`Factor-22`)) %>% setdiff(., names(fac_genes$myeloid$`Factor-21`))
+ic_unique[['fib']] = setdiff(names(fac_genes$fib$`Factor-22`), names(fac_genes$endo$`Factor-15`)) %>% setdiff(., names(fac_genes$myeloid$`Factor-21`))
+ic_unique[['myeloid']] = setdiff(names(fac_genes$myeloid$`Factor-21`), names(fac_genes$endo$`Factor-15`)) %>% setdiff(., names(fac_genes$fib$`Factor-22`) )
+```
+
+How many genes are shared or unique out of total?
+
+```{r}
+print("IFN")
+print(paste("There are ", length(ifn_shared), 'shared IFN genes across lineages out of', length(unique(c(names(fac_genes$endo$`Factor-19`), names(fac_genes$fib$`Factor-9`), names(fac_genes$myeloid$`Factor-17`)))), 'total genes'))
+print(paste("endo unique count:", length(ifn_unique$endo)))
+print(paste("fib unique count:", length(ifn_unique$fib)))
+print(paste("myeloid unique count:", length(ifn_unique$myeloid)))
+
+print("IC")
+print(paste("There are ", length(ic_shared), 'shared IC genes across lineages out of', length(unique(c(names(fac_genes$endo$`Factor-15`), names(fac_genes$fib$`Factor-22`), names(fac_genes$myeloid$`Factor-21`)))), 'total genes'))
+print(paste("endo unique count:", length(ic_unique$endo)))
+print(paste("fib unique count:", length(ic_unique$fib)))
+print(paste("myeloid unique count:", length(ic_unique$myeloid)))
+
+
+
+```
+```{r}
+# shared genes
+print("IC shared genes")
+print(ic_shared)
+print("IFN shared genes")
+print(ifn_shared)
+
+
+
+```
+
+```{r}
+
+# compute scores for each of the gene sets
+
+# first combine and normlize the visium data from serial section 1
+# create a merged object for different downstream analyses
+d.m = merge(d[[1]], d[2:length(d)])#, add.cell.ids = names(d))
+# get genes to filter out
+gene_sum = rowSums(d.m@assays$Spatial@counts)
+gene_rm = gene_sum < 10
+# SCTransform normalize all spots in the merged object for first technical replicate and then subset these for the tumor lesion response
+DefaultAssay(d.m) <- 'Spatial'
+d.m_rep1 = SCTransform(d.m[!(gene_rm),d.m@meta.data$section %in% c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')], assay = "Spatial", verbose = F)
+# fix the images so I don't have all of the ones I don't need
+d.m_rep1@images = d.m_rep1@images[c('slice1', 'slice1.2', 'slice1.4', 'slice1.6')]
+
+```
+
+```{r}
+
+# calculate scores
+# I am also going to include the growth factor in this
+score_genes_list = list(ifn_shared, ifn_unique$endo, ifn_unique$fib, ifn_unique$myeloid, 
+                        ic_shared, ic_unique$endo, ic_unique$fib, ic_unique$myeloid, 
+                        fac_genes$endo$`Factor-12` %>% names())
+names(score_genes_list) = c('ifn_shared', 'ifn_endo', 'ifn_fib', 'ifn_myeloid', 
+                            'ic_shared', 'ic_endo', 'ic_fib', 'ic_myeloid', 
+                            'gf_endo')
+d.m_rep1 = AddModuleScore(d.m_rep1, score_genes_list, name = names(score_genes_list))
+
+# fix the names in the metadata
+colnames(d.m_rep1@meta.data)[grepl('ic_|ifn_|gf_', colnames(d.m_rep1@meta.data))] = gsub("[0-9]$", "", colnames(d.m_rep1@meta.data)[grepl('ic_|ifn_|gf_', colnames(d.m_rep1@meta.data))])
+
+```
+
+```{r}
+
+# add metadata to the seurat visium objects to plot the factor scores in spatial context
+score_dfs = split(d.m_rep1@meta.data[,names(score_genes_list)], d.m_rep1@meta.data$section)
+
+for(i in names(score_dfs)){
+  d[[i]]@meta.data = cbind(d[[i]]@meta.data, score_dfs[[i]])
+}
+
+
+```
+
+```{r, eval = F, fig.height=8, fig.width=10}
+
+# derive cutoffs for the max values to use
+# to standardize the scales for each factor I will get the 95th percentile of all visium spots across all sections for each factor
+
+feature_max = apply(d.m_rep1@meta.data[,names(score_genes_list)], 2, quantile, .99)
+  
+pdf(file.path(fig_dir, 'ifn_ic_geneScore_spatPlot.pdf'), 
+    height = 8, width =)
+invisible(lapply(d[c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')], SpatialFeaturePlotList, names(score_genes_list), feature_max))
+
+dev.off()
+
+```
+### write out the scores
+
+```{r, eval = F}
+saveRDS(score_dfs, file = file.path(fig_dir, 'ic_ifn_scores_rep1.csv'))
+# write.csv(score_dfs, file.path(fig_dir, 'ic_ifn_scores_rep1.csv'), 
+#           row.names = T, quote = F)
+
+```
+
+### gene loadings in shared vs unique
+
+Show that the loadings of the shared genes in both settings are higher than the unique, justifying that these are providing the highest signal to noise of a similarly induced gene program. 
+
+```{r}
+
+# get scores
+ifn_shared_score = list()
+ifn_shared_score[['endo']] = fac_genes$endo$`Factor-19`[ifn_shared]
+ifn_shared_score[['fib']] = fac_genes$fib$`Factor-9`[ifn_shared]
+ifn_shared_score[['myeloid']] = fac_genes$myeloid$`Factor-17`[ifn_shared]
+
+
+# get scores
+ifn_unique_score = list()
+ifn_unique_score[['endo']] = fac_genes$endo$`Factor-19`[ifn_unique$endo]
+ifn_unique_score[['fib']] = fac_genes$fib$`Factor-9`[ifn_unique$fib]
+ifn_unique_score[['myeloid']] = fac_genes$myeloid$`Factor-17`[ifn_unique$myeloid]
+
+
+# get scores
+ic_shared_score = list()
+ic_shared_score[['endo']] = fac_genes$endo$`Factor-15`[ic_shared]
+ic_shared_score[['fib']] = fac_genes$fib$`Factor-22`[ic_shared]
+ic_shared_score[['myeloid']] = fac_genes$myeloid$`Factor-21`[ic_shared]
+
+# get scores
+ic_unique_score = list()
+ic_unique_score[['endo']] = fac_genes$endo$`Factor-15`[ic_unique[['endo']]]
+ic_unique_score[['fib']] = fac_genes$fib$`Factor-22`[ic_unique[['fib']]]
+ic_unique_score[['myeloid']] = fac_genes$myeloid$`Factor-21`[ic_unique[['myeloid']]]
+
+# process into single df
+ic_ifn_score_df = rbind(
+  do.call(rbind, list(lapply(ifn_shared_score, as.matrix) %>% reshape2::melt() %>%
+                        mutate(gene_module = 'ifn'), 
+                    lapply(ic_shared_score, as.matrix) %>% reshape2::melt() %>%
+                        mutate(gene_module = 'ic')
+                    )
+          ) %>%
+  mutate(type = 'shared'), 
+    do.call(rbind, list(lapply(ifn_unique_score, as.matrix) %>% reshape2::melt() %>%
+                        mutate(gene_module = 'ifn'), 
+                    lapply(ic_unique_score, as.matrix) %>% reshape2::melt() %>%
+                        mutate(gene_module = 'ic')
+                    )
+            ) %>%
+  mutate(type = 'unique')
+)
+
+
+```
+
+Plot the loadings of shared and unique genes in each lineage for each type signaling pathway. 
+
+```{r}
+# pdf(file.path(fig_dir, 'shared_vs_unique_geneScores.pdf'), 
+#     height = 8, width = 12)
+ggplot(ic_ifn_score_df, aes(x = type, y = value)) +
+  geom_boxplot() +
+  facet_wrap(gene_module ~ L1) +
+  theme_classic() + 
+  ylab("Gene score") +
+  xlab("Gene type") + 
+    theme(
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14),
+        strip.text.x = element_text(size = 14))
+# dev.off()
+```
+
+This appears to be particularly true for the IFN, with IC less so but the trend still somewhat holding. 
+
+### similar behavior of unique
+
+```{r}
+
+
+unique_cor = cor(d.m_rep1@meta.data[,c('ifn_shared', 'ifn_endo', 'ifn_fib', 'ifn_myeloid', 
+                                       'ic_shared', 'ic_endo', 'ic_fib', 'ic_myeloid')], 
+                 method = 'spearman')
+
+
+```
+
+```{r}
+# pdf(file.path(fig_dir, 'shared_vs_unique_correlation.pdf'), 
+#     height = 6, width = 8)
+Heatmap(unique_cor, 
+        name = "Spearman\ncorrelation")
+#dev.off()
+
+```
+
+## define territories
+
+
+Focus on IFN and IC, remove GF for now. 
+
+```{r}
+
+# need to add a constant to the distribution so that it will work
+pseudo_count = 1
+
+## IFN
+ifn_fit = MASS::fitdistr(d.m_rep1@meta.data[,'ifn_shared'] + pseudo_count, 'gamma')
+
+ifn_para <- ifn_fit$estimate
+gamma_den = function(x, para) dgamma(x, shape = ifn_para[1], rate = ifn_para[2])
+hist(d.m_rep1@meta.data[,'ifn_shared'] + 1, prob = TRUE)
+curve(gamma_den, col = 2, add = TRUE)
+
+## IC
+ic_fit = MASS::fitdistr(d.m_rep1@meta.data[,'ic_shared'] + pseudo_count, 'gamma')
+
+ic_para <- ic_fit$estimate
+gamma_den = function(x, para) dgamma(x, shape = ic_para[1], rate = ic_para[2])
+hist(d.m_rep1@meta.data[,'ic_shared'] + pseudo_count, prob = TRUE)
+curve(gamma_den, col = 2, add = TRUE)
+
+
+```
+
+```{r}
+# what is the cutoff that I should use
+ifn_cutoff = qgamma(.01, shape =  ifn_para[1], rate = ifn_para[2], lower.tail = F) - pseudo_count
+ic_cutoff = qgamma(.01, shape = ic_para[1], rate  = ic_para[2], lower.tail = F) - pseudo_count
+#gf_cutoff = qgamma(.01, shape = gf_para[1], rate = gf_para[2], lower.tail = F) - pseudo_count
+
+print(paste("IFN:", ifn_cutoff, "; IC:", ic_cutoff))#, "Growth factor:", gf_cutoff))
+```
+
+```{r}
+
+
+ifn_niche = (d.m_rep1@meta.data[,'ifn_shared'] > ifn_cutoff) %>% as.factor() %>% as.numeric()
+ic_niche = (d.m_rep1@meta.data[,'ic_shared'] > ic_cutoff) %>% as.factor() %>% as.numeric()
+#gf_niche = (d.m_rep1@meta.data[,'gf_endo'] > gf_cutoff) %>% as.factor() %>% as.numeric()
+
+#niche_labels = cbind(ifn_niche, ic_niche, gf_niche) - 1
+niche_labels = cbind(ifn_niche, ic_niche) - 1
+```
+
+```{r}
+# are there certain areas with multiple labels?
+apply(niche_labels, 1, sum) %>% table()
+
+```
+
+There are 23 spots with an overlap. 
+
+```{r}
+
+niche_vec = apply(niche_labels, 1, function(x){
+  #niche_names = c('IFN', 'IC', 'GF')
+  niche_names = c('IFN', 'IC')
+  paste(niche_names[as.logical(x)], collapse = "+")
+}) 
+niche_vec[niche_vec == ""] <- 'other'
+table(niche_vec, useNA = 'ifany')
+names(niche_vec) = rownames(d.m_rep1@meta.data)
+```
+
+```{r}
+
+niche_df = niche_vec %>% as.matrix() %>% melt() %>%
+  dplyr::select(barcode = Var1, niche = value)
+
+# write out the niche labels
+write.csv(niche_df, file = file.path(fig_dir, 'niche_labels_rep1.csv'), 
+          row.names = F, quote = F)
+
+# read if necessary
+#niche_df = read.csv(file.path(fig_dir, 'niche_labels_rep1.csv'), stringsAsFactors = F)
+```
+
+
+```{r}
+
+# add this metadata to the image objects to be plotted in the spatial context
+invisible(lapply(names(d), function(x){
+  #print(x)
+  nl_filt = niche_vec[grepl(x, names(niche_vec))]
+  #names(nl_filt) = gsub(paste0(x, '.'), "", names(nl_filt))
+  print(paste(sum(names(nl_filt) %in% rownames(d[[x]]@meta.data)), "names out of", length(names(nl_filt))))
+  #print(str(nl_filt))
+  d[[x]]@meta.data[,'niche_label'] <<- nl_filt[rownames(d[[x]]@meta.data)]
+  # d[[x]]@meta.data[,'PC1'] <<- pc_d[rownames(d[[x]]@meta.data), c('PC1')]
+  # d[[x]]@meta.data[,'PC2'] <<- pc_d[rownames(d[[x]]@meta.data), c('PC2')]
+  #d[[x]]@meta.data <<- cbind(d[[x]]@meta.data, pc_d[rownames(d[[x]]@meta.data), c('PC1','PC2')])
+}))
+
+
+```
+
+### spatial plots of niches
+
+```{r, fig.height = 10, fig.width=12}
+niche_pal = c(ggthemes_data$tableau$`color-palettes`$regular$`Tableau 10`$value[c(2:3,6)], 'black')
+#niche_pal = c(ggthemes_data$tableau$`color-palettes`$regular$`Tableau 10`$value[1:6], 'grey')
+names(niche_pal) = c(#'GF', 
+  'IFN', 'IC', 
+                     #'IC+GF', 'IFN+GF', 
+                     'IFN+IC', 'other')#, 'IFN+IC+GF', 'other')
+#'IC+GF', 'IFN+GF', 'IFN+IC', 'IFN+IC+GF', 'other')
+
+
+# pdf(file.path(fig_dir, 'ifn_ic_niche_spatPlot.pdf'), 
+#     height = 10, width = 14)
+SpatialPlotSections(d[c(1,3,5,7)], 'niche_label', scale_fill_manual(values = niche_pal, labels = names(niche_pal)))
+#dev.off()
+```
+
+
+
+
+
+
+### enrichment vs normal tissue 
+
+How I do this currently is to create an empirical null distribution by sampling without replacement from all spots across the tissue. Then, the mean cell type fraction for each cell type is compared to the means of each of the samples and the fraction of sample averages greater than the niche average is taken as the p value. 
+
+```{r}
+
+DefaultAssay(d.m) <- 'BP'
+d.m_rep1.bp = subset(d.m, section %in% c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1'))
+# using the cell_type enrichment function that I wrote in the visium_helper_functions script
+mat.ct = d.m_rep1.bp@assays$BP@counts %>% t()
+# I need to remove certain niches from the analysis because they only have 1 point
+niche_enr = cell_type_enrichment(mat.ct, niche_vec, num_bg_samples = 10000, num_sample = 100)
+# fix names
+niche_enr$celltype = left_join(niche_enr, name_conv_df, by = c('celltype' = 'make_name')) %>% .$orig_name
+```
+
+
+```{r}
+
+# plot the fold change in each niche and color by the empirical p value
+# pdf(file.path(fig_dir, 'cell_enr_ifnIc_empP.pdf'),
+#     height = 4, width = 8)
+niche_enr %>% #dplyr::filter(celltype %in% (dplyr::filter(niche_enr, padj < .05) %>% .$celltype %>% unique())) %>%
+  dplyr::filter(padj < .01) %>%
+  mutate(padj = ifelse(padj > .01, NA_integer_, padj), 
+         log2FC = ifelse(padj > .01, NA_integer_, log2FC)) %>%
+  ggplot(., aes(x = celltype, y = log2FC)) +
+  #geom_bar(aes(fill = num_gt / 10000), stat = 'identity') +
+  geom_bar(aes(fill = padj), 
+    stat = 'identity'#, fill = 'grey'
+    ) +
+  theme_few() +
+  coord_flip() +
+  facet_wrap(~ niche, ncol = 4, scales = "free_x") + 
+  labs(y = 'Celltype RNA fraction log2 fold-change', 
+       x = 'Celltype') + 
+  scale_fill_continuous_tableau(palette = "Gray", name = 'Adjusted emprircal p', trans = 'reverse', 
+                                limits = c(.01, 0)) +
+  theme(legend.position = "bottom") + 
+    theme( strip.text.x = element_text(size = 14),
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14))
+#dev.off()
+
+```
+
+
+
+
+

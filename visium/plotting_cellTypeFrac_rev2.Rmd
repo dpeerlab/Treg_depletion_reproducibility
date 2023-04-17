@@ -1,0 +1,131 @@
+---
+title: "cell fraction plotting"
+output: html_document
+date: "2022-12-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = F, message = 'hide')
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(gridExtra) 
+library(ggdendro)
+  library(readr)
+library(data.table)
+library(DT)
+  library(fgsea)
+  library(sf)
+  library(limma)
+})
+
+# load my functions
+source("/Users/roses3/Dropbox/lung_tumor/sr/scripts/github/visium_helper_functions.R")
+# figure directory
+fig_dir = "~/Dropbox/lung_tumor/sr/results/visium/bp/deconv_plots/"
+
+```
+
+
+
+```{r, message = F, results = 'hide'}
+
+## load 10x data and cell fractions
+
+# load data and remove off tissue points
+# this folder will be set to where 10x visium data files are stored
+base_folder = '/Users/roses3/Dropbox/lung_tumor/sr/data/visium/geo_submission_oct2022_Glasner_etal/processed_visium'
+
+# set working dir
+#setwd(base_folder)
+
+# dirs where visium samples are
+data_folders <- list.dirs(base_folder, recursive = T)
+data_folders <- data_folders[grepl("outs$", data_folders)]
+
+# read in visium data
+#d <- lapply(data_folders, Load10X_Spatial)
+d <- lapply(data_folders, function(x){
+  sample_name <- unlist(lapply(strsplit(x, "/"), "[[", 11)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+  print(sample_name)
+  Load10X_Spatial(x, filename = paste0(sample_name, "_", 'filtered_feature_bc_matrix.h5'))
+})
+names(d) <- unlist(lapply(strsplit(data_folders, "/"), "[[", 11)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+
+# add necessary metadata to the tissue sections
+lapply(names(d), function(x){
+  d[[x]]@meta.data <<- mutate(d[[x]]@meta.data, section = x, 
+                              treatment = ifelse(grepl("Ctrl", x), 'Ctrl', 'DT'))
+})
+# read in cell type fractions
+## these will be available in same github directory
+bp_data_folder = "/Users/roses3/Dropbox/lung_tumor/sr/data/visium/geo_submission_oct2022_Glasner_etal/processed_visium"
+
+ct_frac_files = list.files(bp_data_folder, recursive = T, pattern = "*_theta.csv", full.names = T)
+ct_frac_files = ct_frac_files[!(grepl('tumref', ct_frac_files))]
+
+# read these in as a list with the same names as d, the 10x data
+ct_frac = lapply(ct_frac_files, read.csv, row.names = 1)
+names(ct_frac) = gsub("_theta.csv", "", basename(ct_frac_files))
+
+
+
+# filter the 10x objects that I have for only spots that are in deconvolution
+d = lapply(names(d), function(x){
+  subset(d[[x]], cells = gsub(paste0(x, "_"), "", rownames(ct_frac[[x]])))
+})
+names(d) <- unlist(lapply(strsplit(data_folders, "/"), "[[", 11)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+
+# read in selected spot matrix
+# ssm = read.csv(file.path(bp_data_folder, 'selected_spot_matrix.median3mix.csv' ), 
+#                row.names = 1, stringsAsFactors = F)
+
+# read in cell type name conversion
+#name_conv_df = read.csv( "/data/peer/sam/treg_dep/visium/bayesprism/viter1_nameConvSheet.csv", h = T, stringsAsFactors = F)
+
+
+# add cell type fractions to each section
+lapply(names(d), function(x){
+  ct_frac_add = ct_frac[[x]]
+  rownames(ct_frac_add) = gsub(paste0(x, "_"), "", rownames(ct_frac_add))
+  ct_obj = CreateAssayObject(counts = ct_frac_add %>% t())
+  d[[x]][['BP']] <<- ct_obj
+})
+
+
+# set the active assay for plotting to BP
+for(i in names(d)){
+  DefaultAssay(d[[i]]) <- 'BP'
+}
+```
+
+
+
+
+# plot selected cell types for figures
+
+```{r}
+
+plot_sections = c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')
+
+pdf(file.path(fig_dir, 'cellTypeFrac_viter1_nichePops.pdf'), 
+    height = 6, width = 12)
+SpatialFeaturePlotSections(d[plot_sections], feature = 'MSC', feature_min = 0, feature_max = .15, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'Neutrophil', feature_min = 0, feature_max = .05, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'Basophil', feature_min = 0, feature_max = .03, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'T.cell.ILC2', feature_min = 0, feature_max = .05, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'NK', feature_min = 0, feature_max = .05, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'Monocyte', feature_min = 0, feature_max = .5, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'cDC', feature_min = 0, feature_max = .1, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'Alveolar.macrophage', feature_min = 0, feature_max = .5, color_palette = scale_fill_viridis_c(option = "B"))
+SpatialFeaturePlotSections(d[plot_sections], feature = 'AT2', feature_min = 0, feature_max = .8, color_palette = scale_fill_viridis_c(option = "B"))
+dev.off()
+```

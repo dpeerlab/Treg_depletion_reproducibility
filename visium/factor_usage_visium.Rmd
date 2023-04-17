@@ -1,0 +1,379 @@
+---
+title: "EMF factor usage"
+output: 
+  html_document:
+    df_output: paged
+    toc: TRUE
+    theme: 'simplex'
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = 'hide')
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(gridExtra) 
+library(ggdendro)
+  library(readr)
+library(data.table)
+library(DT)
+  library(fgsea)
+  library(sf)
+  library(limma)
+})
+
+# load my functions
+source("/data/peer/sam/treg_dep/scripts/visium/visium_helper_functions.R")
+# figure directory
+fig_dir = "/data/peer/sam/treg_dep/visium/results/factor_usage"
+
+```
+
+
+# Factor expression niche analysis
+
+```{r, message = F, results = 'hide'}
+
+## load 10x data and cell fractions
+
+# load data and remove off tissue points
+# this folder will be set to where 10x visium data files are stored
+base_folder = '/data/peer/sam/treg_dep/visium/data/requant'
+
+# set working dir
+#setwd(base_folder)
+
+# dirs where visium samples are
+data_folders <- list.dirs(base_folder, recursive = T)
+data_folders <- data_folders[grepl("outs$", data_folders)]
+
+# read in visium data
+d <- lapply(data_folders, Load10X_Spatial)
+names(d) <- unlist(lapply(strsplit(data_folders, "/"), "[[", 10)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+
+# add necessary metadata to the tissue sections
+lapply(names(d), function(x){
+  d[[x]]@meta.data <<- mutate(d[[x]]@meta.data, section = x, 
+                              treatment = ifelse(grepl("Ctrl", x), 'Ctrl', 'DT'))
+})
+# read in cell type fractions
+## these will be available in same github directory
+bp_data_folder = "/data/peer/sam/treg_dep/visium/bayesprism/deconv_viter1"
+
+ct_frac_files = list.files(bp_data_folder, pattern = "*_theta.csv", full.names = T)
+
+# read these in as a list with the same names as d, the 10x data
+ct_frac = lapply(ct_frac_files, read.csv, row.names = 1)
+names(ct_frac) = gsub("_theta.csv", "", basename(ct_frac_files))
+
+
+
+# filter the 10x objects that I have for only spots that are in deconvolution
+d = lapply(names(d), function(x){
+  subset(d[[x]], cells = rownames(ct_frac[[x]]))
+})
+names(d) <- unlist(lapply(strsplit(data_folders, "/"), "[[", 10)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+
+# read in selected spot matrix
+ssm = read.csv(file.path(bp_data_folder, 'selected_spot_matrix.median3mix.csv' ), 
+               row.names = 1, stringsAsFactors = F)
+
+# read in cell type name conversion
+name_conv_df = read.csv( "/data/peer/sam/treg_dep/visium/bayesprism/viter1_nameConvSheet.csv", h = T, stringsAsFactors = F)
+
+```
+
+
+## Shared and unique genes on factors
+
+Find shared genes involved in IFN and IC response across lineages as well as specific genes induced in these factors in particular lineages. 
+
+```{r}
+
+# function to get the genes along each factor
+get_factor_genes = function(fac, gene_names){
+  fac_mean = mean(fac)
+  fac_std = sd(fac)
+  
+  fac_thresh = fac_mean + (2*fac_std)
+  
+  # get the factor genes and order by their score
+  fac_scores = fac[fac > fac_thresh]
+  names(fac_scores) = gene_names[fac > fac_thresh] %>% stringr::str_to_title()
+  fac_genes = sort(fac_scores, decreasing = T) #%>% names()
+  
+  # return the gene names of associated terms to factor
+  return(fac_genes)
+}
+
+read_factor_files = function(file_list){
+  fac.l = invisible(lapply(file_list, readr::read_csv, show_col_types = F))
+  names(fac.l) = sapply(file_list, basename) %>% gsub("*_factor_|\\.csv", "", .)
+  
+  # bind into matrix
+  fac.mat = fac.l %>% purrr::reduce(left_join, by = '...1') %>% as.data.frame()
+  rownames(fac.mat) = fac.mat$...1
+  fac.mat = fac.mat[,-1]
+  
+  return(fac.mat)
+}
+
+
+
+```
+
+```{r}
+
+# list of lists for the factor file names
+mm_factor_files = list(endo = list.files(path = "/data/peer/sam/treg_dep/mouse/results/schpf/endo", pattern = "*.csv", full.names = T), 
+                       fib = list.files(path = "/data/peer/sam/treg_dep/mouse/results/schpf/fib", pattern = "*.csv", full.names = T), 
+                       myeloid = list.files(path = "/data/peer/sam/treg_dep/mouse/results/schpf/myeloid", pattern = "*.csv", full.names = T))
+
+mm_factor.l = lapply(mm_factor_files, read_factor_files)
+
+fac_genes = lapply(mm_factor.l, function(x){
+  apply(x, 2, get_factor_genes, rownames(x))
+})
+```
+
+### factor genes in deconvolved
+
+Check for the number of genes on each of the factors of interest that are shared in the visium and within the deconvolved expression values. 
+
+```{r, include = F, eval = F}
+deconv_genes = ct_exp$Ctrl1_A1_Ctrl1_B1$Pericyte %>% colnames()
+gene_counts = readRDS(file = '/data/peer/sam/treg_dep/visium/data/requant/processed/gene_counts_visium_merged_quant2_20220829.rds')
+gene_exp = names(gene_counts)[gene_counts >= 10]
+
+# endo
+fac_of_interest_endo = c( 'Factor-3', 'Factor-8', 'Factor-12', 'Factor-15', 'Factor-17', 'Factor-19')
+endo_dc_ov = do.call(rbind, lapply(fac_of_interest_endo, function(gl){
+  data.frame(factor_check = gl, 
+             total = length(fac_genes$endo[[gl]]),
+             overlap = sum(names(fac_genes$endo[[gl]]) %in% deconv_genes)) %>%
+    mutate(frac_overlap = overlap / total)
+})
+)
+endo_nodc_ov = do.call(rbind, lapply(fac_of_interest_endo, function(gl){
+  data.frame(factor_check = gl, 
+             total = length(fac_genes$endo[[gl]]),
+             overlap = sum(names(fac_genes$endo[[gl]]) %in% gene_exp)) %>%
+    mutate(frac_overlap = overlap / total)
+})
+)
+
+```
+
+
+This analysis supports using undeconvolved as many genes are missed in the deconvolved. 
+
+
+### compute factor scores
+
+```{r}
+
+# compute scores for each of the gene sets
+
+# first combine and normlize the visium data from serial section 1
+# create a merged object for different downstream analyses
+d.m = merge(d[[1]], d[2:length(d)], add.cell.ids = names(d))
+
+d.m_rep1 = d.m[,d.m@meta.data$section %in% c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')]
+# get genes to filter out
+gene_sum = rowSums(d.m_rep1@assays$Spatial@counts)
+gene_rm = gene_sum < 10
+print(sum(gene_rm))
+# SCTransform normalize all spots in the merged object for first technical replicate and then subset these for the tumor lesion response
+DefaultAssay(d.m_rep1) <- 'Spatial'
+d.m_rep1 = SCTransform(d.m_rep1, assay = "Spatial", verbose = F)
+# fix the images so I don't have all of the ones I don't need
+d.m_rep1@images = d.m_rep1@images[c('slice1', 'slice1.2', 'slice1.4', 'slice1.6')]
+
+```
+
+```{r}
+
+# calculate scores
+# I am also going to include the growth factor in this
+score_genes_list = list(fac_genes$endo$`Factor-3`, fac_genes$endo$`Factor-8`, fac_genes$endo$`Factor-12`, fac_genes$endo$`Factor-15`, fac_genes$endo$`Factor-17`, fac_genes$endo$`Factor-19`, 
+                        fac_genes$fib$`Factor-17`, fac_genes$fib$`Factor-11`, fac_genes$fib$`Factor-14`, fac_genes$fib$`Factor-9`, fac_genes$fib$`Factor-22`, fac_genes$fib$`Factor-21`, 
+                        fac_genes$myeloid$`Factor-2`, fac_genes$myeloid$`Factor-5`, fac_genes$myeloid$`Factor-13`, fac_genes$myeloid$`Factor-15`, fac_genes$myeloid$`Factor-17`, fac_genes$myeloid$`Factor-21`, fac_genes$myeloid$`Factor-23`)
+names(score_genes_list) = c('endo inflammatory capillary', 'endo angiogenesis',  'endo growth factor', 'endo inflammation/hypoxia', 'endo inflammation EndMT', 'endo IFN', 'fib MSC-like', 'fib VEGFC', 'fib ECM', 'fib IFN', 'fib inflammatory cytokine', 'fib inflammation/MT', 'myl C1Q+ macrophage','myl monocyte coagulation', 'myl Csf3r monocyte', 'myl proliferation', 'myl IFN', 'myl monocyte hypoxia', 'myl Arg1+ macrophage' )
+# convert to names
+score_genes_list = lapply(score_genes_list, names)
+
+
+d.m_rep1 = AddModuleScore(d.m_rep1, score_genes_list, name = names(score_genes_list))
+
+# fix the names in the metadata
+colnames(d.m_rep1@meta.data)[grepl('^endo|^fib|^myl', colnames(d.m_rep1@meta.data))] = gsub("[0-9]+$", "", colnames(d.m_rep1@meta.data)[grepl('^endo|^fib|^myl', colnames(d.m_rep1@meta.data))])
+
+```
+
+
+
+```{r}
+fac_m = d.m_rep1@meta.data[,grepl('^endo|^fib|^myl', colnames(d.m_rep1@meta.data))] %>% as.matrix()
+# compute pearson correlation
+fac_cor = cor(fac_m)
+
+```
+
+```{r}
+
+# save file so I don't need to recompute every time
+write.csv(fac_m, file.path(fig_dir, 'foctor_of_interest_moduleScores_rep1.csv'), quote = F)
+
+
+```
+
+```{r, fig.height=6, fig.width=8}
+
+Heatmap(fac_cor)
+
+
+```
+
+
+```{r}
+
+# melt and join to tumor information
+fac_m.m = fac_m %>% as.matrix() %>% reshape2::melt() %>%
+  left_join(data.frame(Var1 = rownames(d.m_rep1@meta.data), 
+                      # tumor_spot = d.m_rep1@meta.data$Tumor_spot, 
+                       condition = d.m_rep1@meta.data$treatment), 
+            by = 'Var1') %>%
+  mutate(lineage = ifelse(grepl("endo", Var2), 'Endothelial', ifelse(grepl("fib", Var2), 'Fibroblast', 'Myeloid'))) %>%
+  dplyr::rename(barcode = Var1, scRNA_factor = Var2, factor_score = value)
+
+```
+
+### cell type specific usage
+
+Get spots where particular cell types are detected and compare factor scores. 
+
+
+```{r}
+
+# loop through  each cell type of interest and extract spots where it is present
+# for each relevant factor of interest in that cell type, compute the mean, sd, sem
+cell_interest_factors = list(
+  'Pericyte' = c('fib.IFN'),
+  "Col14a1..fibroblast" = c('fib.MSC.like', 'fib.VEGFC', 'fib.ECM', 'fib.IFN', 'fib.inflammatory.cytokine', 'fib.inflammation.MT'), 
+  "Myofibroblast" = c('fib.MSC.like', 'fib.VEGFC', 'fib.ECM', 'fib.IFN',  'fib.inflammation.MT'), 
+  "Col13a1..fibroblast" = c( 'fib.IFN', 'fib.inflammatory.cytokine', 'fib.inflammation.MT'),
+  "MSC" = c('fib.MSC.like'),
+  "Monocyte" = c('myl.monocyte.coagulation', 'myl.Csf3r.monocyte', 'myl.IFN', 'myl.monocyte.hypoxia'), 
+  "Alveolar.macrophage" = c('myl.proliferation', 'myl.IFN'), 
+  "Macrophage" = c('myl.C1Q..macrophage', 'myl.Arg1..macrophage', 'myl.IFN'), 
+  "Car4..capillary" = c('endo.inflammatory.capillary', 'endo.IFN'), 
+  "Plvap..capillary" = c('endo.angiogenesis', 'endo.growth.factor', 'endo.inflammation.hypoxia', 'endo.inflammation.EndMT', 'endo.IFN' ),
+  "Lymphatic.endothelial" = c('endo.inflammation.hypoxia', 'endo.inflammation.EndMT')
+)
+
+
+cell_fac_diff = do.call(rbind, lapply(names(cell_interest_factors), function(ct){
+  pos_spots = rownames(ssm[ssm[,ct],])
+  fac_f = dplyr::filter(fac_m.m, barcode %in% pos_spots & scRNA_factor %in% cell_interest_factors[[ct]])
+  do.call(rbind, lapply(cell_interest_factors[[ct]], function(fac_int){
+    fac_test = dplyr::filter(fac_f, scRNA_factor == fac_int)
+    t.test(factor_score ~ condition, data = fac_test) %>% broom::tidy() %>%
+      mutate(celltype = ct, 
+             scRNA_factor = fac_int)
+  }))
+  
+  
+
+})
+)
+
+cell_fac_diff$p.adj = p.adjust(cell_fac_diff$p.value, method = "bonferroni")
+
+```
+
+Barplot representing this test. 
+
+```{r}
+
+ggplot(cell_fac_diff, aes(x = scRNA_factor, y = estimate * -1)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  facet_wrap(~ celltype, scales = "free") +
+  theme_classic()
+
+
+```
+
+```{r}
+# fix the names
+cell_fac_diff$celltype = left_join(cell_fac_diff, name_conv_df, by = c('celltype' = 'make_name')) %>% .$orig_name
+
+fac_conv_df = data.frame(make_name = unique(cell_fac_diff$scRNA_factor), 
+                         orig_name = c('fib IFN', 'fib MSC-like', 'fib VEGFC', 'fib ECM',  'fib inflammatory cytokine', 'fib inflammation/MT', 
+                                       'myl monocyte coagulation','myl Csf3r monocyte', 'myl IFN', 'myl monocyte hypoxia','myl proliferation', 'myl C1Q+ macrophage',     'myl Arg1+ macrophage', 
+                                       'endo inflammatory capillary', 'endo IFN',  'endo angiogenesis',  'endo growth factor', 'endo inflammation/hypoxia', 'endo inflammation EndMT'))
+cell_fac_diff$scRNA_factor_mod = left_join(cell_fac_diff, fac_conv_df, by = c('scRNA_factor' = 'make_name')) %>% .$orig_name #%>% 
+  #gsub("endo |fib |myl ", "", .)
+# arrange in proper order for thing
+cell_fac_diff = do.call(rbind, list(
+  cell_fac_diff[grepl("myl", cell_fac_diff$scRNA_factor),],
+  cell_fac_diff[grepl("fib", cell_fac_diff$scRNA_factor),],
+  cell_fac_diff[grepl("endo", cell_fac_diff$scRNA_factor),]
+)) %>% mutate(
+  celltype = forcats::fct_relevel(factor(celltype), as.character(unique(celltype))), 
+         scRNA_factor = forcats::fct_relevel(factor(scRNA_factor), as.character(unique(scRNA_factor)))) %>%
+  mutate(scRNA_factor_mod = forcats::fct_relevel(factor(scRNA_factor_mod), as.character(unique(scRNA_factor_mod))))
+```
+
+```{r}
+
+# pdf(file.path(fig_dir, 'factor_t_across_condition_dotplot.pdf'),
+#   height = 6, width = 8)
+cell_fac_diff %>%
+  mutate(p.adj = ifelse(p.adj < 1e-215, 1e-216, p.adj)) %>%
+  mutate(estimate = ifelse(p.adj > .001, NA_integer_, estimate)#, 
+         #celltype = forcats::fct_relevel(factor(celltype), as.character(unique(celltype))), 
+         #scRNA_factor = forcats::fct_relevel(factor(scRNA_factor), as.character(unique(scRNA_factor)))
+         ) %>%
+  #arrange(scRNA_factor_mod) %>%
+ # mutate(scRNA_factor_mod = forcats::fct_relevel(factor(scRNA_factor_mod), as.character(unique(scRNA_factor_mod)))) %>%
+  
+  ggplot(., aes(x = celltype, y = scRNA_factor_mod)) +
+  geom_point(aes(color = estimate * -1,
+                 size = -log10(p.adj))#, color = 'black', pch = 21
+             ) +
+  theme_few() +
+  
+  scale_color_gradient2( limits = c(-.07, .07), high = scales::muted('red'), low = scales::muted('blue'), 
+                        oob = scales::squish, 
+                        name = 'Treg depleted - Control\nmean factor score') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5), 
+        axis.text = element_text(size = 14), 
+        axis.title = element_blank()) +
+  scale_y_discrete( labels = gsub("endo |fib |myl ", "", unique(cell_fac_diff$scRNA_factor_mod)))
+#dev.off()
+
+
+
+```
+
+```{r, eval = F, include = F}
+# write out stats
+write.csv(cell_fac_diff, file = file.path(fig_dir, 'factor_condition_ttest_20220910.csv'), 
+          row.names = F, quote =)
+
+
+
+```
+
+
+
