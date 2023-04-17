@@ -1,0 +1,781 @@
+---
+title: "Endothelial factor analysis Glasner etal"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    theme: simplex
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+# set global options
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+This notebook will go through factor anlaysis on endothelial endothelial cells in LUAD patient samples. 
+
+Number of factors used to calculate in scHPF ranges from 15-23 based on a Phenograph cluster number of 13. 
+
+The expression matrix used for factor analysis contained 2,272 cells and 14,112 genes. Only genes expressed in > 1% of cells (23 cells) were used in scHPF. 
+
+
+```{r, results = 'hide', message = F, warning = F, echo = T, include = T}
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(ggthemes)
+library(Matrix)
+library(gridExtra)
+library(viridis)
+library(scattermore)
+library(patchwork)
+library(purrr)
+library(ComplexHeatmap)
+library(extrafont)
+loadfonts(device = 'pdf')
+
+figure_dir = '/Users/roses3/Dropbox/lung_tumor/sr/results/schpf/endo/figs'
+
+# scHPF data directory
+factor_data_dir = '~/Dropbox/lung_tumor/sr/data/htan/split/mesenchymal/luad_only/endo/endo/schpf'
+
+# load Treg proportion and histology data
+# read in histology information
+histology = read_csv("/Users/roses3/Dropbox/lung_tumor/sr/data/htan/sample_lists/HTA.treg_atlas.trackerParsed_20210708.csv")
+
+# load Treg proportion of all hematopoietic as well as only CD3+
+treg_prop = read_csv("~/Dropbox/lung_tumor/sr/data/htan/split/tnk/luad_only/clustering/treg_proportion_per_sample_LS_20210902.csv")
+
+# read in the different factor analaysis files of genes scores
+gs_files = list.files(path = factor_data_dir, pattern = "endo.gene_score.txt", recursive = T, full.names = T)
+gs.l = lapply(gs_files, read_tsv, col_names = F)
+names(gs.l) = unlist(lapply(sapply(gs_files, strsplit, "/"), "[[", 15))
+
+# assign row names to these
+gene_rowname_file = paste0(factor_data_dir, "/endo.genes.txt")
+gene_names = read.table(gene_rowname_file, header = F, stringsAsFactors = F)$V1
+
+# read in the cell scores
+cs_files = list.files(path = factor_data_dir, pattern = "endo.cell_score.txt", recursive = T, full.names = T)
+cs.l = lapply(cs_files, read_tsv, col_names = F)
+names(cs.l) = unlist(lapply(sapply(cs_files, strsplit, "/"), "[[", 15))
+
+# get the sample index for these factors
+sample_index = read_csv('/Users/roses3/Dropbox/lung_tumor/sr/data/htan/split/mesenchymal/luad_only/endo/clustering/figs/endo_filtered_sample_index_20211026.txt')
+
+# load mean cellscore fractions
+csf_files = list.files(path = factor_data_dir, pattern = "endo.mean_cellscore_fraction.txt", recursive = T, full.names = T)
+csf.l = lapply(csf_files, read_tsv)
+names(csf.l) <- unlist(lapply(sapply(csf_files, strsplit, "/"), "[[", 15))
+```
+
+
+```{r, eval = T, include = T}
+
+# quick barplot of Treg proportion
+sample_id = read_csv("/Users/roses3/Dropbox/lung_tumor/sr/data/htan/merged/patient_id_number_conversion_hta_v4.csv")
+
+treg_prop = left_join(treg_prop, sample_id %>% dplyr::select(sample_name, sample_number, hta_id), 
+                      by = 'sample_name')
+
+prop_plot = ggplot(treg_prop, aes(x = factor(hta_id), y = treg_proportion_hema_hvg)) +
+  geom_bar(color = 'black', fill = 'grey', stat = 'identity') +
+  theme_classic() +
+  theme(axis.text = element_text(size = 18),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5),
+        axis.title = element_text(size = 22),
+        text = element_text(family = "Arial")) +
+  labs(x = 'Sample number', y = 'Treg / CD45+')
+
+prop_plot
+```
+
+
+Now I can look into the individual factors and whether they associate with Treg proportion. 
+
+## mean cellscore fraction analysis
+
+First I will check the mean cellscore fraction for the different numbers of factors. This is the mean variance explained per cell by x number of factors at different values of K (factors used in scHPF). 
+
+```{r}
+
+csf.m = reshape2::melt(csf.l, id.vars = 'nfactors') %>% 
+  tidyr::pivot_wider(names_from = variable, values_from = value)
+
+ggplot(csf.m, aes(x = nfactors, y = mean_cellscore_fraction)) +
+  geom_line(aes(color = L1)) +
+  theme_bw() +
+  scale_color_tableau(name = 'scHPF\nfactor number')
+```
+
+Based on this I will choose 22 factors for a primary analysis, saying that this gets 90% of variance explained with 7 factors. 
+
+# factor associations to treg proportion
+
+## correlation calculation
+
+The correlation between Treg proportion and factor usage in each sample was calculated using several different methods of determining Treg proportion. This includes proportion of all hematopoietic (hema) or cd3+ cells (cd3), and clustering by either 2k HVG (hvg) or only genes from the Caushi Nature 2021 paper (cau). Ultimately, the results tend to be similar, but it seems that the proportions calculated using the HVG clustering are more accurate to what we would expect to see. Therefore, for subsequent analysis I will use Treg proportion calculated as a fraction of all hematopoietic cells using the TNK clustering based on 2,000 HVGs. 
+
+The correlations between factor loadings and Treg proportion were calculated for all scHPF k values to assess consistency of results across k. 
+
+Only samples with > 5 endothelial cells are used for the correlation calculation. This amounts to 19 samples after outlier removal.  
+
+The association results displayed below are the mean cell loading for each factor to hematopoietic or CD3+ Treg proportion spearman correlations using a factor number of 22. 
+
+```{r,  message = F, warning = F}
+
+# get the number of cells per sample
+cell_per_sample = dplyr::count(sample_index, sample_name) 
+
+# calculate the mean cell scores for each sample for each factor in each scHPF run and relate to Treg proportion
+mcs.l = lapply(cs.l, function(x){
+  ad = aggregate.data.frame(x, list(sample_index$sample_name), mean) %>%
+    dplyr::rename(sample_name = Group.1)
+  ad = left_join(ad, treg_prop, by = 'sample_name') %>%
+    left_join(cell_per_sample, by = 'sample_name') %>%
+    left_join(histology, by = c('sample_name' = 'sample_name.file')) #%>%
+    
+})
+
+
+# filter for only samples with more than the cell threshold
+cell_thresh = 5
+# can also filter cells from here
+# filtering out the sample "HTA8_1028_1" which is a hyper stimulated sample by type I IFN
+
+mcs.lf = lapply(mcs.l, function(x){
+  # removing type I IFN sample because it presents as an outlier in many cases
+  dplyr::filter(x, n > cell_thresh & !(hta_id %in% c("HTA8_1028_1", 'HTA8_1029_1')) )
+})
+
+# test correlations to each factor at all k values
+factor_cor.l = lapply(mcs.lf, function(l){
+  
+  # loop through each of the proportion calculations and do factor correlations with Treg proportion
+  fc = lapply(colnames(l)[grepl("^treg_proportion", colnames(l))], function(p){
+    #print(p)
+    d = do.call(dplyr::bind_rows, lapply(colnames(l)[grepl("^X[0-9]+", colnames(l))], 
+                                              function(x){
+                                                #print(x)
+                                                d = broom::tidy(cor.test(log2(l[,x]), 
+                                                                         log2(l[,p]), 
+                                                                         method = "spearman"))
+                                                d$factor = x
+                                                return(d)
+                                              }))
+    d$padj = p.adjust(d$p.value, method = "BH")
+    return(d)
+  })
+  names(fc) = gsub("treg_proportion_", "", colnames(l)[grepl("^treg_proportion",colnames(l))])
+  return(fc)
+})
+
+# melt these results
+fc.m = reshape2::melt(factor_cor.l) %>%
+  tidyr::pivot_wider(names_from = variable, values_from = value)
+
+# these can be manually inspected but I will focus on 22 K
+
+# k_22 has the best associations with Treg proportion
+dplyr::filter(fc.m, grepl("hvg",L2) &  L1 == "k_22" & p.value < .27) %>% 
+  dplyr::select(factor, treg_proportion_calculation = L2, 
+                 estimate, p.value, padj)
+```
+
+
+It can be seen that the factors that associate to Treg proportion are somewhat consistent using either proportion of CD3+ or hematopoietic. Factor 11/15 are the most strongly associated factor to Treg proportion and there are a mix of positive and negative associations. 
+
+### table of all factors to Treg proportion
+
+```{r}
+
+dplyr::filter(fc.m, grepl("hvg",L2) &  L1 == "k_22")
+
+
+```
+
+### additive factor correlations
+
+Summing 3, 4, 5 to get the total inflammatory factor signal. I think 'inflammatory' signal is shared between these three. The alignment of these factors to mouse gene programs is discussed below. 
+
+#### justification for additive
+
+Show that factor 4 is sample specific. 
+
+```{r}
+cs = cs.l$k_22
+sample_index = left_join(sample_index, sample_id %>% dplyr::select(sample_name, hta_id), by = 'sample_name')
+#boxplot(cs$X5 ~ sample_index$sample_name, las = 2)
+qplot( sample_index$hta_id, cs$X4, geom = 'boxplot') +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5), 
+        axis.text = element_text(size = 18), 
+        axis.title = element_text(size = 22)) +
+  labs(x = 'Sample name', y = 'Factor 4 cell loading')
+```
+
+This is really only present in HTA8_1007_1 and HTA8_1009_1. 
+
+
+#### factors 3,4,5
+
+Compute the spearman correlation and plot the relationship of the sum of inflammatory endothelial factors. 
+
+```{r}
+
+cor.test(log2(mcs.lf$k_22$X3 + mcs.lf$k_22$X4 + mcs.lf$k_22$X5), log2(mcs.lf$k_22$treg_proportion_hema_hvg), method = 'spearman')
+
+```
+
+Scatterplot of this relationship. 
+
+```{r}
+
+ggplot(data.frame(infl_fac = log2(mcs.lf$k_22$X3 + mcs.lf$k_22$X4 + mcs.lf$k_22$X5), 
+                  treg_prop = log2(mcs.lf$k_22$treg_proportion_hema_hvg), 
+                  n = mcs.lf$k_22$n), aes(x = treg_prop, y = infl_fac)) + 
+    geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  #ggrepel::geom_text_repel(aes(label = sample_name)) +
+  #geom_text(aes(label = sample_name)) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 3+4+5 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) + 
+  ggtitle("Inflammatory Endothelial factors") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+```
+
+This captures the relationship we see in mouse. It can be seen in the section [comparing to mouse factors] below that these 3 factors all map to the inflammation associated mouse factors  (CAR4+, 15 (inflammation/hypoxia)) and are negatively associated to Treg proportion initial to varying degrees. 
+
+
+
+## plots of significant associations
+
+Scatterplots for associations of interest. 
+
+```{r}
+
+## plot the factors of interest against Treg proportion
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X3))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 3 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) + 
+  ggtitle("Inflammatory capillary factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X4))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 4 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample"))  +
+  ggtitle("Inflammation (metallothionein, CCL20)") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X5))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 5 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) +
+  ggtitle("Inflammation (IL6)") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X11))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 11 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) +
+  ggtitle("Type I IFN factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X13))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 11 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) +
+  #ggtitle("Type I IFN factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X14))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 14 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) +
+  #ggtitle("Type I IFN factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X22))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = expression(log[2]*" Factor 22 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) +
+  ggtitle("EMT factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_cd3_hvg), y = log2(X18))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD3+ cells"),
+       y = expression(log[2]*" Factor 18 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) +
+  ggtitle("ANGPT2 factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "left", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+# plotting the growth factor receptor factor
+ggplot(mcs.lf$k_22, aes(x = log2(treg_proportion_hema_hvg), y = log2(X15))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"),
+       y = expression(log[2]*" Factor 15 usage in sample")) +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) +
+  ggtitle("Growth factor receptor factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "left", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+
+```
+
+There is a positive association to a type I IFN gene factor (11), but this does not really look that strong in the plot above. From the others, the cleanest are factor 3 and 4, which are the inflammatory capillary and CCL20/metallothionein factors negatively associated with Treg proportion. The growth factor receptor and EMT factors show a positive trend, but they are a little less clean. 
+
+## comparison to vec signatures
+
+Looking at the mean expression of the convserved VEC genes from mouse LUAD and lung fibrosis Treg depletion to see if it lines up with Treg proportion consistently. 
+
+```{r}
+
+vec = read_csv("/Users/roses3/Dropbox/lung_tumor/sr/data/htan/split/mesenchymal/luad_only/endo/clustering/figs/mean_vec_signature.csv")
+vec_imp = read_csv("/Users/roses3/Dropbox/lung_tumor/sr/data/htan/split/mesenchymal/luad_only/endo/clustering/figs/mean_imp_vec_signature.csv")
+
+# filter out samples with less than 5 endothelial cells
+vec = left_join(vec, cell_per_sample, by = 'sample_name') %>% dplyr::filter(n > 5 & !(sample_name %in% c("HTA8_1028_1", 'HTA8_1029_1')))
+vec_imp = left_join(vec_imp, cell_per_sample, by = 'sample_name') %>% dplyr::filter(n > 5 & !(sample_name %in% c("HTA8_1028_1", 'HTA8_1029_1')))
+```
+
+
+```{r}
+# plotting
+# pdf(file.path(figure_dir, "conservedVEC_meanExpression_treg_scatter.pdf"),
+#     height = 4, width = 6)
+ggplot(vec, aes(x = treg_prop_l2, y = log2(vec_gene_mean))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  #ggrepel::geom_text_repel(aes(label = sample_name)) +
+  #geom_text(aes(label = sample_name)) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = "Conserved VEC signature") +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) + 
+  #ggtitle("Inflammatory capillary factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+
+ggplot(vec_imp, aes(x = treg_prop_l2, y = log2(vec_imp_gene_mean))) +
+  geom_point(aes(size = n), color = 'black', fill = 'grey', pch = 21) +
+  #ggrepel::geom_text_repel(aes(label = sample_name)) +
+  #geom_text(aes(label = sample_name)) +
+  theme_classic() +
+  labs(x = expression(log[2]*" Treg / CD45+ cells"), 
+       y = "Conserved VEC signature (imputed)") +
+  guides(size=guide_legend(title="Endothelial cells\nin sample")) + 
+  #ggtitle("Inflammatory capillary factor") +
+  ggpubr::stat_cor(method = "spearman", label.x.npc = "middle", size = 4) +
+  geom_smooth(method = "lm", fill = 'grey80', linetype = 2)
+#dev.off()
+
+```
+It is consistent with Treg depletion in that there is higher use of this gene program with a lower amount of Treg cells   . 
+
+## examine gene scores of significant factors
+
+Genes are assigned to factors if their loading is > mean + 2 standard deviations of the factor loadings for all genes on that factor. 
+
+Some barplots below of the loadings onto factors of genes of interest. 
+
+```{r, results = 'hide', message = F, warning = F}
+
+# extract genes scores for 22 factors
+gs = gs.l$k_22 %>% as.data.frame()
+rownames(gs) <- gene_names
+
+
+# define a function to get genes associated with particular factors
+# this takes the mean factor loading of all genes for a factor 
+# and then assigns a gene to that factor if it's score is 
+# greater than the mean + 2 standard deviations
+get_factor_genes = function(fac, gene_names){
+  fac_mean = mean(fac)
+  fac_std = sd(fac)
+  
+  fac_thresh = fac_mean + (2*fac_std)
+  
+  # get the factor genes and order by their score
+  fac_scores = fac[fac > fac_thresh]
+  names(fac_scores) = gene_names[fac > fac_thresh]
+  fac_genes = sort(fac_scores, decreasing = T) #%>% names()
+  
+  # return the gene names of associated terms to factor
+  return(fac_genes)
+}
+
+# get genes for each factor
+hs_fac_genes = apply(gs, 2, get_factor_genes, gene_names)
+
+# barplots for genes of interest
+genes_of_interest = c('CD34', 'KDR', 'FLT1', 'CA4', 'PDGFB', 
+                      'VEGFA',
+                      'NID2', 'KCNE3', 'DLL4', 
+                      'CSF3', 'IL6', 
+                      # adding genes from the conserved VEC signature
+                      'TGIF1', 'SOCS2', 'CSF1', 'TIFA', 'ICOSL', 'LAT2', 'FOSL2', 'MAFF', 'BCL3')
+
+lapply(genes_of_interest, function(x){
+  barplot(as.matrix(gs[x,]), las = 2, 
+          main = paste("Factor loadings for", x))
+})
+
+
+```
+
+How many genes are on each factor?
+
+```{r}
+lapply(hs_fac_genes, length) %>% reshape2::melt() %>%
+  dplyr::rename(n_genes = value, human_factor = L1)
+
+```
+
+
+## factor annotations
+
+Genes associated at the top of factors are in parentheses. 
+
+* Factor 3 = inflammatory capillary (CA4, IL1RL1, CD300LG). Other high ranked genes of interest on this factor include CD36, TIMP3, EGFR, LIFR, MEIS1, IFNGR1, GATA6. 
+* Factor 4 = Maps most closely to the mouse factor 15 which was labeled inflammation and hypoxia. However, this factor is highly similar to the inflammatory fibroblast factor with top genes including metallothionein genes, IL1RL1, CCL20, with IL6 on the list as well. Interestingly, this factor contains CSF3 and CXCL1 (neutrophil/monocyte recruiters), and CSFR3+ myeloid cells seem to be increased in both human and mouse tumors with less Tregs. This also contains TNFRSF12A (TWEAK) which potentiates VEGFA and FGF2 signaling and acts as a growth and chemotactic factor in endothelial cells. 
+* Factor 15 = growth factor receptor factor (ESM1, NID2, PGF, DEPTOR, LOX, SPP1, KDR, CD34, PDGFRA)
+* Factor 22 = associates with EMT mouse factor. Some cell cycle genes, PDGFRL, VAT1L, FGF13. This could be related to angiogenesis/cell cycle as well.
+  
+
+# comparing to mouse factors
+
+
+Here I am
+
+1.  filtering the factors for only one2one orthologous genes between mouse and human
+2.  calculating the jaccard similarity of genes associated with each factor across species (shared genes / union of all genes)
+3.  plot a heatmap of these results
+
+
+```{r, results = 'hide', message = F, warning = F}
+mm_factor_files = list.files(path = "/Users/roses3/Dropbox/lung_tumor/sr/results/mouse/schpf/endo", pattern = "*.csv", full.names = T)
+
+mm_factor.l = lapply(mm_factor_files, read_csv)
+names(mm_factor.l) = sapply(mm_factor_files, basename) %>% gsub("endothelial_factor_|\\.csv", "", .)
+
+# bind into matrix
+mm_fac = mm_factor.l %>% reduce(left_join, by = '...1') %>% as.data.frame()
+rownames(mm_fac) = mm_fac$...1
+mm_fac = mm_fac[,-1]
+
+# take Jaccard of orthologous genes across factors from either species
+## load orthologue mappings
+ortho = read_csv("~/Dropbox/reference_genomes/Mus_musculus/ortho/human_mouse_ortho_withType.csv")
+ortho_f = dplyr::filter(ortho, `Mouse homology type` == "ortholog_one2one" & (!(is.na(`Mouse gene name`) | is.na(`Gene name`)))) %>%
+  dplyr::select( `Mouse gene name`, `Gene name`) %>% 
+  distinct() %>%
+  mutate(mouse_name = toupper(`Mouse gene name`))
+
+# filter the factor files for only orthologous genes that can be converted
+gs_o = gs[rownames(gs) %in% (ortho_f$`Gene name` %>% unique()),]
+
+# change names of mouse to human
+mm_fac_o = mm_fac[rownames(mm_fac) %in% (toupper(ortho_f$mouse_name) %>% unique()),]
+# change the rownames to the human name
+rownames(mm_fac_o) = left_join(data.frame(mouse_name = rownames(mm_fac_o)), 
+                               ortho_f %>% mutate(mouse_name = toupper(`Mouse gene name`)), 
+                               by = 'mouse_name') %>% 
+  dplyr::select(mouse_name, `Gene name`) %>% distinct() %>% .$`Gene name`
+
+# get common genes between the two
+common_genes = rownames(gs_o)[rownames(gs_o) %in% rownames(mm_fac_o)]
+
+# preserve the order
+mm_fac_o_cg = mm_fac_o[common_genes,]
+gs_o_cg = gs_o[common_genes,]
+
+## run jaccard of genes associated onto factors across both species
+# get list of orthologous genes associated with each factor using my method for each species
+hs_fac_gl = apply(gs_o_cg, 2, get_factor_genes, common_genes)
+# change the names of the human one to be Factor- something as well
+names(hs_fac_gl) = gsub("X", "Factor-", names(hs_fac_gl))
+mm_fac_gl = apply(mm_fac_o_cg, 2, get_factor_genes, common_genes)
+
+## calculate jaccard
+# initialize matrix
+fac_jaccard = matrix(nrow = length(hs_fac_gl), 
+                     ncol = length(mm_fac_gl), 
+                     dimnames = list(names(hs_fac_gl), 
+                                     names(mm_fac_gl)))
+
+jaccard_genes = function(a, b){
+  tot = length(unique(c(a,b)))
+  ov = a %in% b %>% sum()
+  jac = ov/tot
+  return(jac)
+}
+
+# calculate cross-species jaccard of 
+invisible(
+  lapply(names(hs_fac_gl), function(h){
+    lapply(names(mm_fac_gl), function(m){
+      fac_jaccard[h,m] <<- jaccard_genes(names(hs_fac_gl[[h]]), 
+                                         names(mm_fac_gl[[m]]))
+    })
+  })
+)
+
+# plot a heatmap of this
+Heatmap(fac_jaccard, name = 'Jaccard\nindex', row_title = 'Human factors', 
+        # row_labels = gsub("X", "F", rownames(fac_jaccard)),
+        # column_labels  = gsub("Factor-", "F", colnames(fac_jaccard)),
+        column_title = 'Mouse factors')
+
+```
+
+
+The heatmap shows there is good correspondence between certain factors in human and mouse. 
+
+Next I take factors that correspond across species and get their overlapping genes. 
+
+First I am making a boxplot of the Jaccard index values of associated genes for each mouse to human factor comparison. 
+
+```{r}
+# get shared genes across factors of interest
+## get all the factor pairs that have a jaccard > than a threshold
+boxplot(fac_jaccard, las = 2, xlab = 'Mouse factor', ylab = 'Jaccard index')
+abline(h = .06, lty = 2, col = 'grey')
+```
+Based on the above boxplot, a threshold of 0.06 for the jaccard index should suffice to detemine conserved factors.
+
+
+
+### overlap between conserved VEC signature
+
+Looking at where the loadings for genes in the conserved VEC signature fall in my factors. Plotted are the non-imputed genes conserved between bleomycin and luad VEC factors. Normalized gene loadings are the fraction of the total gene loading across all factors for each gene. 
+
+```{r}
+
+cons_vec_genes = c('SDCBP2', 'PER1', 'FBXW10', 'JAK3', 'FOXP4', 'TGIF1', 'THA1', 'BEAN1', 'POGK', 'FAM69B', 'CDC42EP4', 'PARP3', 'MRC2', 'BHLHE40', 'STX11', 'ICAM4', 'MAP3K14', 'NOCT', 'NR1D2', 'H2-Q6', '6230400D17RIK', 'SOCS2', '1110017D15RIK', 'TINAGL1', 'WSB1', 'CSF1', 'TIFA', 'GRAMD1A', 'CASP4', 'EGR2', 'SLC25A25', 'BIRC3', 'MT2', 'OAF', 'VARS', 'NEURL3', 'RDH5', 'NR1D1', 'ZMYND15', 'S1PR2', 'TNFAIP3', 'CSRNP1', 'IRF5', 'GCH1', 'ARRDC2', 'NOD2', 'RD3', 'COL11A2', 'ICOSL', 'LAT2', 'FOSL2', 'MAFF', 'SH2B2', 'BCL3', 'PPP1R18', 'DLL1', 'RAB20', 'PRR7', 'N4BP2L1', 'FKBP5', 'CTPS', 'ZFP516')
+
+
+gs_vec.n = apply(gs[rownames(gs) %in% cons_vec_genes,], 1, function(x) x / sum(x)) %>% t()
+
+gs_vec.nm = gs_vec.n %>% reshape2::melt() %>% 
+  dplyr::rename(gene = Var1, fac = Var2, normalized_gene_loading = value) %>%
+  mutate(fac = gsub("X", "", fac)) %>%
+  arrange(as.numeric(fac)) %>%
+  mutate(fac = forcats::fct_relevel(factor(fac), as.character(unique(fac)))) 
+
+vec_lp = ggplot(gs_vec.nm, aes(x = fac, y = normalized_gene_loading)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(x = 'Factor', y = 'Normalized gene loading VEC genes') +
+  ggrepel::geom_text_repel(data = gs_vec.nm %>% dplyr::filter(as.character(fac) %in% c('3', '5') & normalized_gene_loading > .2), 
+                           aes(label = gene), size = 3
+                           ) + 
+  geom_point(data = gs_vec.nm %>% dplyr::filter(as.character(fac) %in% c('3', '5') & normalized_gene_loading > .2), 
+             color = 'firebrick') +
+  theme(axis.text = element_text(size = 18), 
+        axis.title = element_text(size = 22), 
+        text = element_text(family = 'Arial'))
+vec_lp
+#ggsave(file.path(figure_dir, 'conserved_vec_genes_normalizedLoadingsHuman.pdf'), width = 12, height = 6, device = cairo_pdf)
+```
+
+# plotting human vs mouse gene scores
+
+Here I am generating plots to show the overlap in gene programs from human and mouse that we identify in the factors. 
+
+## load cytokine gene sets
+
+Here I will load cytokine gene sets so that I can visualize VEGF induced genes. 
+
+```{r}
+
+# load the gene sets and get genes in the correct format
+cond_sigs.bn = readRDS("~/Dropbox/reference_genomes/Homo_sapiens/gene_sets/cytosig/cytosig_TreatCond_sigGenes_lungCurated_20211115.rds")
+
+
+```
+
+## normalize gene scores
+
+I'm going to normalize gene scores by the sum of their loadings across factors to see if that helps the visualization. 
+
+```{r}
+
+mm_fac_o_cg.n = apply(mm_fac_o_cg, 1, function(x) x / sum(x)) %>% t()
+gs_o_cg.n = apply(gs_o_cg, 1, function(x) x / sum(x)) %>% t()
+
+```
+
+## plot individual factor comparisons
+
+```{r}
+
+# take union of all genes along factors and plot their gene scores against one another
+
+plotGeneScoreComp = function(mouse_factor, human_factor, highlight_label = NULL, ov_thresh = 0){
+  
+  # get all the genes attributed to either factor
+  mouse_genes = lapply(mouse_factor, function(x){
+    names(mm_fac_gl[[x]])
+  }) %>% unlist() %>% unique()
+  
+  human_genes = lapply(human_factor, function(x){
+    names(hs_fac_gl[[x]])
+  }) %>% unlist() %>% unique()
+  
+  all_genes = union(mouse_genes, human_genes)
+  
+  if(length(mouse_factor) > 1){
+    gs_mm = apply(mm_fac_o_cg.n[all_genes,mouse_factor], 1, sum)
+  }
+  
+  if(length(mouse_factor) == 1){
+    gs_mm = mm_fac_o_cg.n[all_genes,mouse_factor]
+  }
+  
+    if(length(human_factor) > 1){
+    gs_hs = apply(gs_o_cg.n[all_genes, gsub("Factor-", "X", human_factor)], 1, sum)
+  }
+  
+  if(length(human_factor) == 1){
+    gs_hs = gs_o_cg.n[all_genes, gsub("Factor-", "X", human_factor)]
+  }
+  
+  # d = data.frame(gene = all_genes, 
+  #                gene_score_mm = mm_fac_o_cg.n[all_genes,mouse_factor], 
+  #                gene_score_hs = gs_o_cg.n[all_genes, gsub("Factor-", "X", human_factor)])
+  
+  d = data.frame(gene = all_genes, 
+                 gene_score_mm = gs_mm, 
+                 gene_score_hs = gs_hs) 
+  
+  ov_genes = intersect(mouse_genes, human_genes)
+  
+  gp = ggplot(d, aes(x = gene_score_mm, y = gene_score_hs)) +
+    geom_point(alpha = .3) +
+    # geom_point(data = dplyr::filter(d, gene %in% ortho_factors_ov_genes[[paste0(mouse_factor, ":", human_factor)]]), 
+    #            color = 'firebrick') +
+    geom_point(data = dplyr::filter(d, gene %in% ov_genes),
+               color = 'firebrick') +
+    geom_point(data = dplyr::filter(d, gene %in% ov_genes & gene %in% highlight_label),
+               color = 'purple3') +
+    theme_classic() +
+    # ggrepel::geom_text_repel(data = dplyr::filter(d, gene_score_hs > .2 & gene_score_mm > .2),
+    #                          aes(label = gene))
+    # ggrepel::geom_text_repel(data = dplyr::filter(d, gene %in% ortho_factors_ov_genes[[paste0(mouse_factor, ":", human_factor)]]),
+    #                           aes(label = gene)) +
+    # ggrepel::geom_text_repel(data = dplyr::filter(d, gene %in% ov_genes),
+    #                           aes(label = gene)) +
+    labs(x = 'Normalized gene loading mouse', y = 'Normalized gene loading human') + 
+    theme(axis.text = element_text(size = 16), 
+          axis.title = element_text(size = 20))
+  
+  if(!(is.null(highlight_label))){
+    
+    gp = gp + ggrepel::geom_text_repel(data = dplyr::filter(d, (gene %in% ov_genes) &
+                                                              ((gene_score_hs > ov_thresh & gene_score_mm > ov_thresh) | 
+                                                                 (gene %in% highlight_label))) %>%
+                                         mutate(highlight_genes = gene %in% highlight_label),
+                               aes(label = gene, 
+                                   color = highlight_genes, 
+                                   #fontface = highlight_genes
+                                   ), force = 2) + 
+      scale_color_manual(values = c('black', 'purple3'), guide = F)
+  }
+  gp
+}
+
+dfGeneScoreComp = function(mouse_factor, human_factor, highlight_label = NULL, ov_thresh = 0){
+  
+  # get all the genes attributed to either factor
+  mouse_genes = lapply(mouse_factor, function(x){
+    names(mm_fac_gl[[x]])
+  }) %>% unlist() %>% unique()
+  
+  human_genes = lapply(human_factor, function(x){
+    names(hs_fac_gl[[x]])
+  }) %>% unlist() %>% unique()
+  
+  all_genes = union(mouse_genes, human_genes)
+  
+  if(length(mouse_factor) > 1){
+    gs_mm = apply(mm_fac_o_cg.n[all_genes,mouse_factor], 1, sum)
+  }
+  
+  if(length(mouse_factor) == 1){
+    gs_mm = mm_fac_o_cg.n[all_genes,mouse_factor]
+  }
+  
+    if(length(human_factor) > 1){
+    gs_hs = apply(gs_o_cg.n[all_genes, gsub("Factor-", "X", human_factor)], 1, sum)
+  }
+  
+  if(length(human_factor) == 1){
+    gs_hs = gs_o_cg.n[all_genes, gsub("Factor-", "X", human_factor)]
+  }
+  
+  # d = data.frame(gene = all_genes, 
+  #                gene_score_mm = mm_fac_o_cg.n[all_genes,mouse_factor], 
+  #                gene_score_hs = gs_o_cg.n[all_genes, gsub("Factor-", "X", human_factor)])
+  
+  d = data.frame(gene = all_genes, 
+                 gene_score_mm = gs_mm, 
+                 gene_score_hs = gs_hs) 
+  
+  ov_genes = intersect(mouse_genes, human_genes)
+  
+  d
+}
+
+```
+
+
+Plot the relationship. 
+
+```{r, fig.height = 7, fig.width=8}
+
+
+plotGeneScoreComp('Factor-15', c('Factor-4', 'Factor-5'), highlight_label = cond_sigs.bn$Endothelial$VEGFA$gene, 
+                  ov_thresh = .3) +
+  labs(x = "Normalized gene loading mouse 15", y = "Normalized gene loading human 4+5")
+  
+
+
+```
+
+
+
+
+
+
